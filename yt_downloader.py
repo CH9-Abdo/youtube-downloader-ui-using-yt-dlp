@@ -1,92 +1,25 @@
 import sys
 import os
-import subprocess
+import shutil
+import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QRadioButton, QButtonGroup, QTextEdit, QFileDialog,
-                             QComboBox, QGroupBox, QMessageBox)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+                             QComboBox, QGroupBox, QMessageBox, QProgressBar)
+from PyQt5.QtCore import Qt, QProcess, QSettings
 from PyQt5.QtGui import QFont
-#the winner takes it all 
-
-class DownloadThread(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
-    
-    def __init__(self, url, download_type, output_path, video_format=None, audio_format=None, quality=None):
-        super().__init__()
-        self.url = url
-        self.download_type = download_type
-        self.output_path = output_path
-        self.video_format = video_format
-        self.audio_format = audio_format
-        self.quality = quality
-        
-    def run(self):
-        try:
-            output_template = os.path.join(self.output_path, "%(title)s.%(ext)s")
-            
-            if self.download_type == "video":
-                # Build video download command
-                command = f'yt-dlp -o "{output_template}"'
-                
-                # Add format/quality options
-                if self.quality == "best":
-                    command += ' -f "bestvideo+bestaudio/best"'
-                elif self.quality == "720p":
-                    command += ' -f "bestvideo[height<=720]+bestaudio/best[height<=720]"'
-                elif self.quality == "480p":
-                    command += ' -f "bestvideo[height<=480]+bestaudio/best[height<=480]"'
-                elif self.quality == "360p":
-                    command += ' -f "bestvideo[height<=360]+bestaudio/best[height<=360]"'
-                
-                # Add video format conversion if needed
-                if self.video_format and self.video_format != "default":
-                    command += f' --recode-video {self.video_format}'
-                
-                command += f' "{self.url}"'
-                
-            else:  # audio
-                command = f'yt-dlp -x --audio-format {self.audio_format} -o "{output_template}" "{self.url}"'
-                
-                # Add audio quality
-                if self.quality:
-                    command += f' --audio-quality {self.quality}'
-            
-            self.progress.emit(f"Running command: {command}\n")
-            
-            process = subprocess.Popen(
-                command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            
-            for line in process.stdout:
-                self.progress.emit(line.strip())
-            
-            process.wait()
-            
-            if process.returncode == 0:
-                self.finished.emit(True, "Download completed successfully!")
-            else:
-                self.finished.emit(False, f"Command failed with return code: {process.returncode}")
-                
-        except Exception as e:
-            self.finished.emit(False, f"Error: {str(e)}")
-
 
 class YouTubeDownloader(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.process = None
+        self.settings = QSettings("MySoft", "YouTubeDownloader")
         self.initUI()
-        self.download_thread = None
+        self.check_dependencies()
         
     def initUI(self):
         self.setWindowTitle('YouTube Downloader - Advanced')
-        self.setGeometry(100, 100, 800, 700)
+        self.setGeometry(100, 100, 800, 750)
         
         # Central widget
         central_widget = QWidget()
@@ -211,7 +144,14 @@ class YouTubeDownloader(QMainWindow):
         path_label = QLabel('Save to:')
         path_label.setFont(QFont('Arial', 10))
         self.path_input = QLineEdit()
-        self.path_input.setText(os.path.expanduser('~/Videos'))
+        
+        # Restore last used path or default
+        last_path = self.settings.value("last_download_path")
+        if last_path and os.path.exists(last_path):
+            self.path_input.setText(last_path)
+        else:
+            self.path_input.setText(os.path.expanduser('~/Videos'))
+            
         self.path_input.setFont(QFont('Arial', 10))
         self.browse_btn = QPushButton('Browse')
         self.browse_btn.setFont(QFont('Arial', 10))
@@ -221,6 +161,16 @@ class YouTubeDownloader(QMainWindow):
         path_layout.addWidget(self.path_input)
         path_layout.addWidget(self.browse_btn)
         layout.addLayout(path_layout)
+        
+        # Progress Bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_bar)
+
+        # Buttons Layout
+        btn_layout = QHBoxLayout()
         
         # Download button
         self.download_btn = QPushButton('Download')
@@ -240,10 +190,33 @@ class YouTubeDownloader(QMainWindow):
             }
         """)
         self.download_btn.clicked.connect(self.start_download)
-        layout.addWidget(self.download_btn)
+        btn_layout.addWidget(self.download_btn)
+        
+        # Cancel button
+        self.cancel_btn = QPushButton('Cancel')
+        self.cancel_btn.setFont(QFont('Arial', 12, QFont.Bold))
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #d32f2f;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self.cancel_download)
+        self.cancel_btn.setEnabled(False)
+        btn_layout.addWidget(self.cancel_btn)
+        
+        layout.addLayout(btn_layout)
         
         # Progress/Status area
-        status_label = QLabel('Status:')
+        status_label = QLabel('Log Output:')
         status_label.setFont(QFont('Arial', 10, QFont.Bold))
         layout.addWidget(status_label)
         
@@ -254,22 +227,44 @@ class YouTubeDownloader(QMainWindow):
         layout.addWidget(self.status_text)
         
         central_widget.setLayout(layout)
+
+    def check_dependencies(self):
+        missing = []
+        if not shutil.which("yt-dlp"):
+            missing.append("yt-dlp")
+        if not shutil.which("ffmpeg"):
+            missing.append("ffmpeg")
+            
+        if missing:
+            QMessageBox.warning(
+                self, 
+                "Missing Dependencies", 
+                f"The following required tools were not found in your PATH:\n\n{', '.join(missing)}\n\n" \
+                "Please install them to use this application."
+            )
+            self.download_btn.setEnabled(False)
+            self.status_text.append(f"CRITICAL: Missing dependencies: {', '.join(missing)}")
     
     def on_type_changed(self):
         is_video = self.video_radio.isChecked()
         self.video_options_group.setVisible(is_video)
         self.audio_options_group.setVisible(not is_video)
         
-        # Update default path
-        if is_video:
-            self.path_input.setText(os.path.expanduser('~/Videos'))
-        else:
-            self.path_input.setText(os.path.expanduser('~/Music'))
+        # Only switch default paths if user hasn't manually selected a weird one (heuristic)
+        current_path = self.path_input.text()
+        video_path = os.path.expanduser('~/Videos')
+        music_path = os.path.expanduser('~/Music')
+        
+        if is_video and current_path == music_path:
+            self.path_input.setText(video_path)
+        elif not is_video and current_path == video_path:
+            self.path_input.setText(music_path)
     
     def browse_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Download Folder")
+        folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.path_input.text())
         if folder:
             self.path_input.setText(folder)
+            self.settings.setValue("last_download_path", folder)
     
     def start_download(self):
         url = self.url_input.text().strip()
@@ -286,64 +281,123 @@ class YouTubeDownloader(QMainWindow):
         if not os.path.exists(output_path):
             try:
                 os.makedirs(output_path)
-            except:
-                QMessageBox.warning(self, 'Warning', 'Could not create output directory!')
+            except Exception as e:
+                QMessageBox.warning(self, 'Warning', f'Could not create output directory!\n{str(e)}')
                 return
         
+        # Save last used path
+        self.settings.setValue("last_download_path", output_path)
+
+        # Prepare UI
+        self.download_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.url_input.setEnabled(False)
+        self.status_text.clear()
+        self.progress_bar.setValue(0)
+        self.status_text.append(f"Starting download...\nTarget: {output_path}")
+
+        # Build Arguments
+        args = ["--newline", "--no-colors"] # --newline essential for parsing progress
+        
+        # Output template
+        output_template = os.path.join(output_path, "% (title)s.%(ext)s")
+        args.extend(["-o", output_template])
+
         download_type = "video" if self.video_radio.isChecked() else "audio"
-        
-        # Get options
-        video_format = None
-        audio_format = None
-        quality = None
-        
+
         if download_type == "video":
-            quality_map = {'Best': 'best', '720p': '720p', '480p': '480p', '360p': '360p'}
-            quality = quality_map[self.video_quality_combo.currentText()]
+            quality_map = {'Best': 'best', '720p': 'bestvideo[height<=720]+bestaudio/best[height<=720]', '480p': 'bestvideo[height<=480]+bestaudio/best[height<=480]', '360p': 'bestvideo[height<=360]+bestaudio/best[height<=360]'}
+            quality_arg = quality_map[self.video_quality_combo.currentText()]
+            args.extend(["-f", quality_arg])
             
             video_format_text = self.video_format_combo.currentText().lower()
             if video_format_text != 'default':
-                video_format = video_format_text
+                args.extend(["--recode-video", video_format_text])
         else:
             audio_format = self.audio_format_combo.currentText()
+            args.extend(["-x", "--audio-format", audio_format])
             
             quality_map = {'Best (0)': '0', 'High (2)': '2', 'Medium (5)': '5', 'Low (9)': '9'}
-            quality = quality_map[self.audio_quality_combo.currentText()]
-        
-        self.download_btn.setEnabled(False)
-        self.status_text.clear()
-        self.status_text.append(f"Starting download...")
-        self.status_text.append(f"URL: {url}")
-        self.status_text.append(f"Type: {download_type.upper()}")
-        self.status_text.append(f"Output: {output_path}\n")
-        
-        self.download_thread = DownloadThread(url, download_type, output_path, video_format, audio_format, quality)
-        self.download_thread.progress.connect(self.update_progress)
-        self.download_thread.finished.connect(self.download_finished)
-        self.download_thread.start()
-    
-    def update_progress(self, message):
-        self.status_text.append(message)
-        self.status_text.verticalScrollBar().setValue(
-            self.status_text.verticalScrollBar().maximum()
-        )
-    
-    def download_finished(self, success, message):
-        self.status_text.append(f"\n{message}")
-        self.download_btn.setEnabled(True)
-        
-        if success:
-            QMessageBox.information(self, 'Success', message)
-        else:
-            QMessageBox.critical(self, 'Error', message)
+            args.extend(["--audio-quality", quality_map[self.audio_quality_combo.currentText()]])
 
+        args.append(url)
+
+        # QProcess Setup
+        self.process = QProcess()
+        self.process.setProgram("yt-dlp")
+        self.process.setArguments(args)
+        
+        self.process.readyReadStandardOutput.connect(self.handle_stdout)
+        self.process.readyReadStandardError.connect(self.handle_stderr)
+        self.process.finished.connect(self.process_finished)
+        self.process.errorOccurred.connect(self.process_error)
+        
+        self.status_text.append(f"Executing: yt-dlp {' '.join(args)}\n")
+        self.process.start()
+    
+    def handle_stdout(self):
+        data = self.process.readAllStandardOutput()
+        text = bytes(data).decode("utf8", errors="ignore")
+        self.status_text.insertPlainText(text)
+        self.status_text.ensureCursorVisible()
+        
+        # Parse progress
+        # Look for [download] 45.6% ...
+        lines = text.split('\n')
+        for line in lines:
+            if "[download]" in line and "%" in line:
+                match = re.search(r"(\d+\.\d+)%", line)
+                if match:
+                    try:
+                        percentage = float(match.group(1))
+                        self.progress_bar.setValue(int(percentage))
+                    except ValueError:
+                        pass
+
+    def handle_stderr(self):
+        data = self.process.readAllStandardError()
+        text = bytes(data).decode("utf8", errors="ignore")
+        self.status_text.insertPlainText(text)
+        self.status_text.ensureCursorVisible()
+
+    def cancel_download(self):
+        if self.process and self.process.state() == QProcess.Running:
+            self.status_text.append("\nCancelling download...")
+            self.process.kill()
+
+    def process_finished(self, exit_code, exit_status):
+        self.download_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.url_input.setEnabled(True)
+        self.process = None
+        
+        if exit_status == QProcess.NormalExit and exit_code == 0:
+            self.progress_bar.setValue(100)
+            QMessageBox.information(self, 'Success', 'Download completed successfully!')
+            self.status_text.append("\nDone.")
+        elif exit_status == QProcess.CrashExit: # Killed
+             self.status_text.append("\nProcess cancelled or crashed.")
+             self.progress_bar.setValue(0)
+        else:
+            QMessageBox.critical(self, 'Error', f'Download failed with exit code {exit_code}. Check logs.')
+            self.status_text.append(f"\nFailed (Code {exit_code}).")
+
+    def process_error(self, error):
+        if error == QProcess.FailedToStart:
+             QMessageBox.critical(self, 'Error', 'yt-dlp failed to start. Is it installed?')
+             self.reset_ui_state()
+
+    def reset_ui_state(self):
+        self.download_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.url_input.setEnabled(True)
+        self.process = None
 
 def main():
     app = QApplication(sys.argv)
     window = YouTubeDownloader()
     window.show()
     sys.exit(app.exec_())
-
 
 if __name__ == '__main__':
     main()
