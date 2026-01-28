@@ -299,9 +299,9 @@ class YouTubeDownloader(QMainWindow):
         # Build Arguments
         args = ["--newline", "--no-colors"] # --newline essential for parsing progress
         
-        # Output template
-        output_template = os.path.join(output_path, "% (title)s.%(ext)s")
-        args.extend(["-o", output_template])
+        # Output path and template
+        args.extend(["-P", output_path])
+        args.extend(["-o", "%(title)s.%(ext)s"])
 
         download_type = "video" if self.video_radio.isChecked() else "audio"
 
