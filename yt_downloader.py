@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QComboBox, QGroupBox, QMessageBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
-
+#the winner takes it all 
 
 class DownloadThread(QThread):
     progress = pyqtSignal(str)
